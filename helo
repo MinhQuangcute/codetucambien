@@ -1,0 +1,311 @@
+// =====================================================================
+// ESP32 – 2 LOCKERS (L1, M1)
+// Relay + Servo + Firebase (REST API)
+// Đồng bộ với Backend: Command Object + lastAck + lastSensorAt heartbeat
+// =====================================================================
+
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <ESP32Servo.h>
+#include <time.h>
+
+// ================== WIFI ==================
+const char* WIFI_SSID     = "Khoi Nguyen";
+const char* WIFI_PASSWORD = "abcde12345";
+
+// ================== FIREBASE ==================
+String FIREBASE_URL = "https://minhquang-36ee2-default-rtdb.firebaseio.com";
+
+// ================== NTP ==================
+const char* ntpServer = "pool.ntp.org";
+const long  gmtOffset_sec = 7 * 3600;
+const int   daylightOffset_sec = 0;
+
+// ================== SERVO CONFIG ==================
+const int SERVO_STEP_DELAY = 15;   // ms
+const int SERVO_STEP       = 1;
+
+// ================== SETTINGS ==================
+const unsigned long AUTO_CLOSE_DELAY = 60000;
+const unsigned long POLL_DELAY = 600;      // poll nhanh hơn cho demo (ms)
+const unsigned long HEARTBEAT_DELAY = 800; // heartbeat (ms)
+unsigned long lastPoll = 0;
+unsigned long lastHeartbeat = 0;
+
+// ================== LOCKER STRUCT ==================
+struct LockerHW {
+  const char* id;
+  int relayPin;
+  int servoPin;
+  int itemSensorPin;  // placeholder
+  int doorSensorPin;  // placeholder
+  bool activeLow;
+
+  int angleOpen;
+  int angleClose;
+
+  Servo servo;
+  bool isOpen;
+  int currentPos;
+  unsigned long openTime;
+};
+
+// ================== LOCKER CONFIG ==================
+LockerHW lockers[] = {
+  // id   relay servo  item  door  activeLow  open   close
+  { "L1", 5,    19,    34,   35,   false,     0,     100 },
+  { "M1", 25,   26,    32,   33,   false,     90,    0   }
+};
+
+constexpr int N = sizeof(lockers) / sizeof(lockers[0]);
+String lastCmdId[N]; // chống chạy lại cùng 1 lệnh
+
+// =====================================================================
+// UTIL
+// =====================================================================
+uint64_t nowMs() {
+  time_t t = time(nullptr);
+  if (t <= 0) return 0;
+  return (uint64_t)t * 1000ULL;
+}
+
+// =====================================================================
+// FIREBASE REST
+// =====================================================================
+String firebaseGet(String path) {
+  HTTPClient http;
+  http.begin(FIREBASE_URL + path + ".json");
+  int code = http.GET();
+  if (code != 200) {
+    http.end();
+    return "";
+  }
+  String payload = http.getString();
+  http.end();
+  return payload;
+}
+
+void firebaseSet(String path, String json) {
+  HTTPClient http;
+  http.begin(FIREBASE_URL + path + ".json");
+  http.addHeader("Content-Type", "application/json");
+  http.PUT(json);
+  http.end();
+}
+
+String lockerBase(const char* id) {
+  return String("/Lockers/") + id;
+}
+
+void clearCommandObj(const char* id) {
+  // Backend muốn command = null cho sạch
+  firebaseSet(lockerBase(id) + "/command", "null");
+}
+
+// Ghi lastAck để backend waitAck() bắt được
+void ackLastAck(const char* lid, const char* cmdId, const char* action, const char* status) {
+  uint64_t ms = nowMs();
+  if (ms == 0) ms = (uint64_t)millis(); // fallback nếu NTP chưa sync
+
+  String base = lockerBase(lid);
+
+  // JSON object
+  String json = "{";
+  json += "\"commandId\":\"" + String(cmdId) + "\",";
+  json += "\"action\":\""    + String(action) + "\",";
+  json += "\"status\":\""    + String(status) + "\",";
+  json += "\"at\":"          + String((unsigned long long)ms);
+  json += "}";
+
+  firebaseSet(base + "/lastAck", json);
+}
+
+// =====================================================================
+// HARDWARE CONTROL
+// =====================================================================
+void setRelay(LockerHW &L, bool on) {
+  digitalWrite(L.relayPin, L.activeLow ? (on ? LOW : HIGH) : (on ? HIGH : LOW));
+}
+
+void moveServoSmooth(LockerHW &L, int target) {
+  if (L.currentPos == target) return;
+  int step = (target > L.currentPos) ? SERVO_STEP : -SERVO_STEP;
+  while (L.currentPos != target) {
+    L.currentPos += step;
+    L.servo.write(L.currentPos);
+    delay(SERVO_STEP_DELAY);
+  }
+}
+
+// ====== SENSOR PLACEHOLDER (tùy bạn nối thật thì bật 2 dòng digitalRead) ======
+bool checkHasItem(LockerHW &L) {
+  // Ví dụ: IR LOW = có hàng
+  // return digitalRead(L.itemSensorPin) == LOW;
+  return false;
+}
+
+bool checkIsDoorClosed(LockerHW &L) {
+  // Ví dụ: reed HIGH = đóng
+  // return digitalRead(L.doorSensorPin) == HIGH;
+  // fallback theo trạng thái servo
+  return !L.isOpen;
+}
+
+// Report cho backend: doorState/hasItem/lastSeenAt/lastSensorAt/netState
+void reportState(LockerHW &L) {
+  String base = lockerBase(L.id);
+
+  String dState = L.isOpen ? "\"opened\"" : "\"closed\"";
+  firebaseSet(base + "/doorState", dState);
+
+  String hItem = checkHasItem(L) ? "true" : "false";
+  firebaseSet(base + "/hasItem", hItem);
+
+  uint64_t ms = nowMs();
+  if (ms == 0) ms = (uint64_t)millis(); // fallback
+
+  firebaseSet(base + "/lastSeenAt",  String((unsigned long long)ms));
+  firebaseSet(base + "/lastSensorAt",String((unsigned long long)ms));
+  firebaseSet(base + "/netState", "\"online\"");
+}
+
+void doOpen(LockerHW &L) {
+  setRelay(L, true);
+  delay(400);
+  moveServoSmooth(L, L.angleOpen);
+  L.isOpen = true;
+  L.openTime = millis();
+}
+
+void doClose(LockerHW &L) {
+  moveServoSmooth(L, L.angleClose);
+  delay(300);
+  setRelay(L, false);
+  L.isOpen = false;
+}
+
+// =====================================================================
+// SETUP
+// =====================================================================
+void setup() {
+  Serial.begin(115200);
+
+  // WiFi
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(400);
+  }
+  Serial.println("\nWiFi connected");
+
+  // NTP
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  Serial.print("Sync NTP");
+  time_t t = time(nullptr);
+  while (t < 1700000000) { // chờ sync (mốc epoch cho chắc)
+    Serial.print("*");
+    delay(500);
+    t = time(nullptr);
+  }
+  Serial.println("\nNTP synced");
+
+  // Init lockers
+  for (int i = 0; i < N; i++) {
+    pinMode(lockers[i].relayPin, OUTPUT);
+    digitalWrite(lockers[i].relayPin, lockers[i].activeLow ? HIGH : LOW);
+
+    pinMode(lockers[i].itemSensorPin, INPUT_PULLUP);
+    pinMode(lockers[i].doorSensorPin, INPUT_PULLUP);
+
+    lockers[i].servo.setPeriodHertz(50);
+    lockers[i].servo.attach(lockers[i].servoPin, 500, 2500);
+
+    lockers[i].currentPos = lockers[i].angleClose;
+    lockers[i].servo.write(lockers[i].currentPos);
+
+    lockers[i].isOpen = false;
+    lockers[i].openTime = 0;
+
+    lastCmdId[i] = "";
+
+    // Clear command cho sạch + report state
+    clearCommandObj(lockers[i].id);
+    reportState(lockers[i]);
+  }
+
+  Serial.println("System ready");
+}
+
+// =====================================================================
+// LOOP
+// =====================================================================
+void loop() {
+  // AUTO CLOSE
+  for (int i = 0; i < N; i++) {
+    if (lockers[i].isOpen && millis() - lockers[i].openTime >= AUTO_CLOSE_DELAY) {
+      doClose(lockers[i]);
+      reportState(lockers[i]);
+      // không tạo ACK ở auto-close (tùy bạn muốn)
+      clearCommandObj(lockers[i].id);
+    }
+  }
+
+  // HEARTBEAT định kỳ
+  if (millis() - lastHeartbeat >= HEARTBEAT_DELAY) {
+    lastHeartbeat = millis();
+    for (int i = 0; i < N; i++) reportState(lockers[i]);
+  }
+
+  // POLL command
+  if (millis() - lastPoll < POLL_DELAY) return;
+  lastPoll = millis();
+
+  for (int i = 0; i < N; i++) {
+    const char* lid = lockers[i].id;
+    String cmdRaw = firebaseGet(lockerBase(lid) + "/command");
+    if (cmdRaw.length() == 0) continue;
+    if (cmdRaw == "null" || cmdRaw == "\"none\"") continue;
+
+    // Parse command object: {id, action, status, ...}
+    StaticJsonDocument<768> cmdDoc;
+    DeserializationError err = deserializeJson(cmdDoc, cmdRaw);
+    if (err) continue;
+
+    const char* status = cmdDoc["status"] | "";
+    const char* action = cmdDoc["action"] | "";
+    const char* cmdId  = cmdDoc["id"]     | "";
+
+    if (strcmp(status, "PENDING") != 0) continue;
+    if (strlen(cmdId) == 0 || strlen(action) == 0) continue;
+
+    // chống chạy lại cùng cmdId
+    if (lastCmdId[i] == String(cmdId)) {
+      // nếu backend chưa cleanup, mình vẫn clear để khỏi bị lặp
+      clearCommandObj(lid);
+      continue;
+    }
+
+    Serial.printf("[ESP] Execute %s cmdId=%s on %s\n", action, cmdId, lid);
+
+    bool ok = true;
+    if (strcmp(action, "open") == 0) {
+      doOpen(lockers[i]);
+    } else if (strcmp(action, "close") == 0) {
+      doClose(lockers[i]);
+    } else {
+      ok = false;
+    }
+
+    // report sensor + ACK cho backend
+    reportState(lockers[i]);
+    ackLastAck(lid, cmdId, action, ok ? "OK" : "FAILED");
+
+    // clear command sạch
+    clearCommandObj(lid);
+
+    // nhớ cmdId đã xử lý
+    lastCmdId[i] = String(cmdId);
+  }
+}
